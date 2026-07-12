@@ -1,6 +1,6 @@
 # Pi Agent Extensions
 
-This directory contains local Pi coding-agent extensions.
+This directory contains my local Pi coding-agent extensions.
 
 ## Extensions
 
@@ -54,6 +54,9 @@ prompts for approval when needed. It also protects write/edit tools for targets
 outside the current working directory or in sensitive locations. Commands
 include `/whitelist`, `/blacklist`, and `/yolo [on|off]`; settings are
 persisted in `~/.pi/agent/shell-permissions.json`.
+
+This implementation also has explicit support for the approval hooks in
+https://github.com/rmt/pi-snap-edit-approval-handshake
 
 ### `single-line-footer.ts`
 

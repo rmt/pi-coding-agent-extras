@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, resolve, relative, sep } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 type State = {
 	patterns: string[];
@@ -12,6 +12,37 @@ const HOME = resolve(process.env.HOME ?? "/HOME_ENV_NOT_SET");
 const CONFIG_PATH = resolve(HOME, ".pi", "agent", "shell-permissions.json");
 const DEFAULT_PATTERNS = ["^pwd$", "^ls(\\s|$)", "^head(\\s|$)", "^git status(\\s|$)", "^git diff(\\s|$)"];
 const WRITE_TOOLS = new Set(["edit", "write", "quick_edit", "target_edit"]);
+const SNAP_EDIT_TOOLS = new Set(["quick_edit", "target_edit"]);
+const SNAP_EDIT_APPROVAL_CHANNEL = "pi-snap-edit:approval-request:v1";
+const SNAP_EDIT_APPROVAL_CAPABILITY_CHANNEL = "pi-snap-edit:approval-capability:v1";
+
+type SnapEditApprovalRequest = {
+	version: 1;
+	toolCallId: string;
+	toolName: "quick_edit" | "target_edit";
+	path: string;
+	cwd: string;
+	preview: string;
+	attempt: number;
+	signal?: AbortSignal;
+	claim: () => boolean;
+	respond: (decision: { approved: boolean; reason?: string }) => void;
+};
+
+function isSnapEditApprovalRequest(data: unknown): data is SnapEditApprovalRequest {
+	if (typeof data !== "object" || data === null) return false;
+	const request = data as Partial<SnapEditApprovalRequest>;
+	return request.version === 1
+		&& SNAP_EDIT_TOOLS.has(request.toolName ?? "")
+		&& typeof request.toolCallId === "string"
+		&& typeof request.path === "string"
+		&& typeof request.cwd === "string"
+		&& typeof request.preview === "string"
+		&& Number.isInteger(request.attempt)
+		&& (request.attempt ?? 0) >= 1
+		&& typeof request.claim === "function"
+		&& typeof request.respond === "function";
+}
 
 function safeRealpath(path: string): string | undefined {
 	try {
@@ -35,6 +66,14 @@ const CANONICAL_HOME = canonicalPathForComparison(HOME);
 function isInsideOrSame(parent: string, child: string): boolean {
 	const rel = relative(parent, child);
 	return rel === "" || (!rel.startsWith("..") && rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+const BUILTIN_WRITE_ALLOWED_FILES = new Set([
+	canonicalPathForComparison("/dev/null"),
+]);
+
+function isBuiltinWriteAllowedTarget(path: string): boolean {
+	return BUILTIN_WRITE_ALLOWED_FILES.has(path);
 }
 
 function displayPath(path: string): string {
@@ -194,6 +233,7 @@ function shellTokens(command: string): ShellToken[] {
 				op += command[i];
 			}
 			while ([">", "<", "&", "|"].includes(command[i + 1])) op += command[++i];
+			if (/^(?:\d*)<<$/.test(op) && command[i + 1] === "-") op += command[++i];
 			tokens.push({ text: op, quoted: false });
 			continue;
 		}
@@ -214,6 +254,14 @@ function isRedirect(token: string): boolean {
 	return /^(?:\d*)[<>]/.test(token);
 }
 
+function isHereDocRedirect(token: string): boolean {
+	return /^(?:\d*)<<-?$/.test(token);
+}
+
+function isHereStringRedirect(token: string): boolean {
+	return /^(?:\d*)<<<$/.test(token);
+}
+
 function isFdTarget(token: string | undefined): boolean {
 	return !token || token === "-" || /^&?-?\d+$/.test(token) || token === "&-";
 }
@@ -226,8 +274,46 @@ function looksLikePath(token: string): boolean {
 	return token.length > 0 && !token.startsWith("-") && !/^[A-Z_][A-Z0-9_]*=/.test(token) && !/[{};$|&<>]/.test(token);
 }
 
+type HereDoc = { delimiter: string; stripTabs: boolean };
+
+function hereDocDelimiters(commandLine: string): HereDoc[] {
+	const tokens = shellTokens(commandLine);
+	const delimiters: HereDoc[] = [];
+	for (let i = 0; i < tokens.length; i++) {
+		const token = tokens[i].text;
+		if (!isHereDocRedirect(token)) continue;
+		const delimiter = tokens[i + 1]?.text;
+		if (delimiter && !isFdTarget(delimiter)) {
+			delimiters.push({ delimiter, stripTabs: token.endsWith("-") });
+			i++;
+		}
+	}
+	return delimiters;
+}
+
+function stripHereDocBodies(command: string): string {
+	const lines = command.split("\n");
+	const kept: string[] = [];
+
+	for (let i = 0; i < lines.length; i++) {
+		const line = lines[i];
+		kept.push(line);
+
+		for (const doc of hereDocDelimiters(line)) {
+			i++;
+			while (i < lines.length) {
+				const candidate = doc.stripTabs ? lines[i].replace(/^\t+/, "") : lines[i];
+				if (candidate === doc.delimiter) break;
+				i++;
+			}
+		}
+	}
+
+	return kept.join("\n");
+}
+
 function analyzeShellFileAccess(command: string): ShellFileAccess[] {
-	const tokens = shellTokens(command);
+	const tokens = shellTokens(stripHereDocBodies(command));
 	const accesses: ShellFileAccess[] = [];
 	let commandName: string | undefined;
 	const args: string[] = [];
@@ -285,8 +371,12 @@ function analyzeShellFileAccess(command: string): ShellFileAccess[] {
 			continue;
 		}
 		if (isRedirect(token)) {
+			if (isHereDocRedirect(token) || isHereStringRedirect(token)) {
+				i++;
+				continue;
+			}
 			const target = tokens[i + 1]?.text;
-			if (target && !isFdTarget(target)) {
+			if (target && !isFdTarget(target) && looksLikePath(target)) {
 				accesses.push({ mode: token.includes(">") ? "write" : "read", path: target, source: `redirection ${token}` });
 			}
 			i++;
@@ -343,6 +433,8 @@ export default function (pi: ExtensionAPI) {
 	let sessionApprovedWriteFiles = new Set<string>();
 	let sessionApprovedWriteDirs = new Set<string>();
 	let yoloMode = false;
+	let currentCtx: ExtensionContext | undefined;
+	let snapEditApprovalQueue: Promise<void> = Promise.resolve();
 
 	function persist() {
 		saveState(state);
@@ -369,6 +461,7 @@ export default function (pi: ExtensionAPI) {
 		const cwdIsHome = normalizedCwd === CANONICAL_HOME;
 		const cwdOutsideHome = !isInsideOrSame(CANONICAL_HOME, normalizedCwd);
 
+		if (isBuiltinWriteAllowedTarget(normalizedTarget)) return false;
 		if (sessionApprovedWriteFiles.has(normalizedTarget)) return false;
 		for (const dir of sessionApprovedWriteDirs) {
 			if (isInsideOrSame(dir, normalizedTarget)) return false;
@@ -376,6 +469,17 @@ export default function (pi: ExtensionAPI) {
 
 		if (cwdIsHome || cwdOutsideHome) return true;
 		return !isInsideOrSame(normalizedCwd, normalizedTarget);
+	}
+
+	function hasSnapEditApprovalProtocol(): boolean {
+		let supported = false;
+		pi.events.emit(SNAP_EDIT_APPROVAL_CAPABILITY_CHANNEL, {
+			version: 1,
+			acknowledge() {
+				supported = true;
+			},
+		});
+		return supported;
 	}
 
 	async function approveWriteTool(event: { toolName: string; input: unknown }, ctx: any) {
@@ -435,7 +539,94 @@ Reason: ${reason}`,
 			.map((access) => ({ ...access, target: canonicalPathForComparison(resolve(ctx.cwd, access.path)) }));
 	}
 
+	async function approveSnapEditRequest(data: SnapEditApprovalRequest): Promise<void> {
+		try {
+			if (yoloMode || !requiresWriteApproval(data.path, data.cwd)) {
+				data.respond({ approved: true });
+				return;
+			}
+
+			const ctx = currentCtx;
+			if (!ctx) {
+				data.respond({ approved: false, reason: `${data.toolName} approval unavailable: no active session context` });
+				return;
+			}
+
+			const target = canonicalPathForComparison(resolve(data.cwd, data.path));
+			const dir = dirname(target);
+			const normalizedCwd = canonicalPathForComparison(data.cwd);
+			const reason = normalizedCwd === CANONICAL_HOME
+				? "CWD is your home directory"
+				: !isInsideOrSame(CANONICAL_HOME, normalizedCwd)
+					? "CWD is outside your home directory"
+					: "target is outside the CWD";
+
+			if (!ctx.hasUI) {
+				data.respond({ approved: false, reason: `${data.toolName} requires approval: ${displayPath(target)} (${reason})` });
+				return;
+			}
+
+			const refreshed = data.attempt > 1
+				? `\n\nThe file changed after the previous preview. Review refreshed plan #${data.attempt}.`
+				: "";
+			const choice = await ctx.ui.select(
+				`Approve ${data.toolName} planned patch?${refreshed}
+
+File:
+  ${displayPath(target)}
+
+CWD:
+  ${displayPath(normalizedCwd)}
+
+Reason: ${reason}`,
+				["Allow once", `Allow directory for session (${displayPath(dir)})`, `Allow explicit file for session (${displayPath(target)})`, "Reject with feedback", "Reject"],
+				data.signal ? { signal: data.signal } : undefined,
+			);
+
+			if (choice === "Allow once") {
+				data.respond({ approved: true });
+				return;
+			}
+			if (choice?.startsWith("Allow directory")) {
+				sessionApprovedWriteDirs.add(dir);
+				data.respond({ approved: true });
+				return;
+			}
+			if (choice?.startsWith("Allow explicit file")) {
+				sessionApprovedWriteFiles.add(target);
+				data.respond({ approved: true });
+				return;
+			}
+			if (choice === "Reject with feedback" && !data.signal?.aborted) {
+				const feedback = await ctx.ui.input(`Reject ${data.toolName} with feedback`, "Tell the assistant what to do instead...");
+				const suffix = feedback?.trim() ? ` Feedback: ${feedback.trim()}` : "";
+				data.respond({ approved: false, reason: `Rejected ${data.toolName} planned patch.${suffix}` });
+				return;
+			}
+			data.respond({ approved: false, reason: data.signal?.aborted ? `${data.toolName} approval cancelled` : `Rejected ${data.toolName} planned patch.` });
+		} catch (error) {
+			data.respond({ approved: false, reason: `${data.toolName} approval failed: ${error instanceof Error ? error.message : String(error)}` });
+		}
+	}
+
+	pi.events.on(SNAP_EDIT_APPROVAL_CHANNEL, async (data) => {
+		if (!isSnapEditApprovalRequest(data) || !data.claim()) return;
+		if (yoloMode || !requiresWriteApproval(data.path, data.cwd)) {
+			data.respond({ approved: true });
+			return;
+		}
+
+		const queued = snapEditApprovalQueue.then(
+			() => approveSnapEditRequest(data),
+			() => approveSnapEditRequest(data),
+		);
+		snapEditApprovalQueue = queued.catch(() => {});
+		await queued;
+	});
+
 	pi.on("session_start", (_event, ctx) => {
+		currentCtx = ctx;
+		snapEditApprovalQueue = Promise.resolve();
 		sessionApprovedCommands = new Set<string>();
 		sessionApprovedWriteFiles = new Set<string>();
 		sessionApprovedWriteDirs = new Set<string>();
@@ -460,7 +651,7 @@ Reason: ${reason}`,
 	});
 
 	pi.registerCommand("yolo", {
-		description: "Toggle shell YOLO mode (allow all non-blacklisted bash commands)",
+		description: "Toggle permissions YOLO mode (allow non-blacklisted shell commands and auto-approve snap edits)",
 		handler: async (args, ctx) => {
 			const mode = args.trim().toLowerCase();
 			if (mode === "on") {
@@ -475,7 +666,7 @@ Reason: ${reason}`,
 			}
 
 			updateStatus(ctx);
-			ctx.ui.notify(`Shell permissions mode: ${yoloMode ? "YOLO (blacklist still requires approval)" : "whitelist"}`, "info");
+			ctx.ui.notify(`Shell permissions mode: ${yoloMode ? "YOLO (shell blacklist still applies; snap edits auto-approved)" : "whitelist"}`, "info");
 		},
 	});
 
@@ -508,7 +699,7 @@ Reason: ${reason}`,
 				}
 				state[patternsKey].push(pattern);
 				persist();
-				ctx.ui.notify(`Added shell ${commandName} regex:\n/${pattern}/`, "success");
+				ctx.ui.notify(`Added shell ${commandName} regex:\n/${pattern}/`, "info");
 				return;
 			}
 
@@ -520,7 +711,7 @@ Reason: ${reason}`,
 				}
 				const [removed] = state[patternsKey].splice(index - 1, 1);
 				persist();
-				ctx.ui.notify(`Removed shell ${commandName} regex:\n/${removed}/`, "success");
+				ctx.ui.notify(`Removed shell ${commandName} regex:\n/${removed}/`, "info");
 				return;
 			}
 
@@ -529,7 +720,7 @@ Reason: ${reason}`,
 				if (!ok) return;
 				state[patternsKey] = [];
 				persist();
-				ctx.ui.notify(`Cleared shell ${commandName}.`, "success");
+				ctx.ui.notify(`Cleared shell ${commandName}.`, "info");
 				return;
 			}
 
@@ -542,8 +733,11 @@ Reason: ${reason}`,
 	registerPatternCommand("blacklist", "blacklistPatterns");
 
 	pi.on("tool_call", async (event, ctx) => {
-		const writeApproval = await approveWriteTool(event, ctx);
-		if (writeApproval) return writeApproval;
+		const usesExecutionApproval = SNAP_EDIT_TOOLS.has(event.toolName) && hasSnapEditApprovalProtocol();
+		if (!usesExecutionApproval) {
+			const writeApproval = await approveWriteTool(event, ctx);
+			if (writeApproval) return writeApproval;
+		}
 
 		if (event.toolName !== "bash") return undefined;
 
