@@ -84,10 +84,11 @@ function accountInfoFromToken(source: AccountInfo["source"], token: string, expl
 }
 
 async function getPiAccount(ctx: ExtensionCommandContext): Promise<AccountInfo | undefined> {
-	const token = await ctx.modelRegistry.authStorage.getApiKey(OPENAI_CODEX_PROVIDER, { includeFallback: false });
+	// ModelRegistry no longer exposes authStorage. Resolve the provider token via
+	// its public compatibility API; the JWT normally contains the account id.
+	const token = await ctx.modelRegistry.getApiKeyForProvider(OPENAI_CODEX_PROVIDER);
 	if (!token) return undefined;
-	const credential = ctx.modelRegistry.authStorage.get(OPENAI_CODEX_PROVIDER) as any;
-	return accountInfoFromToken("pi", token, credential?.accountId);
+	return accountInfoFromToken("pi", token);
 }
 
 async function getCodexCliAccount(): Promise<AccountInfo | undefined> {

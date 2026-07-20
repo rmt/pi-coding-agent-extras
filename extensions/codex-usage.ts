@@ -100,10 +100,11 @@ function accountInfoFromToken(token: string, explicitAccountId?: string): Accoun
 }
 
 async function getPiAccount(ctx: ExtensionCommandContext): Promise<AccountInfo> {
-	const token = await ctx.modelRegistry.authStorage.getApiKey(OPENAI_CODEX_PROVIDER, { includeFallback: false });
+	// ModelRegistry no longer exposes authStorage. Resolve the provider token via
+	// its public compatibility API; the JWT normally contains the account id.
+	const token = await ctx.modelRegistry.getApiKeyForProvider(OPENAI_CODEX_PROVIDER);
 	if (!token) throw new Error("No ChatGPT OAuth credentials found. Run /login and choose ChatGPT Plus/Pro (Codex Subscription).");
-	const credential = ctx.modelRegistry.authStorage.get(OPENAI_CODEX_PROVIDER) as any;
-	const account = accountInfoFromToken(token, credential?.accountId);
+	const account = accountInfoFromToken(token);
 	if (!account.accountId) throw new Error("Could not determine ChatGPT account id from OAuth token.");
 	return account;
 }
