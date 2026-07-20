@@ -379,6 +379,14 @@ function limitLine(label: string, window?: LimitWindow): string {
 	return `${label}: ${Math.round(left)}% left (${resetText(window.resetsAt)})`;
 }
 
+function durationLabel(window: LimitWindow, fallback: string): string {
+	const mins = window.windowDurationMins;
+	if (!mins) return fallback;
+	if (mins >= 60 * 24 * 6) return "Weekly limit";
+	if (mins % 60 === 0) return `${mins / 60}h limit`;
+	return `${mins}m limit`;
+}
+
 function expiryText(value?: string): string {
 	if (!value) return "expiry unknown";
 	const date = new Date(value);
@@ -412,8 +420,16 @@ function renderReport(report: Report, width: number, theme: any): string[] {
 	rows.push(line(`Peak daily: ${formatTokens(report.usage.peakDailyTokens)}`));
 	rows.push(line(`Streak: ${report.usage.currentStreakDays ?? "n/a"} current / ${report.usage.longestStreakDays ?? "n/a"} longest`));
 	rows.push(line());
-	rows.push(line(limitLine("Daily/5h limit", report.limits?.primary)));
-	rows.push(line(limitLine("Weekly limit", report.limits?.secondary)));
+	// ChatGPT may expose only a weekly primary window.
+	if (report.limits?.primary) {
+		rows.push(line(limitLine(durationLabel(report.limits.primary, "5h limit"), report.limits.primary)));
+	}
+	if (report.limits?.secondary) {
+		rows.push(line(limitLine(durationLabel(report.limits.secondary, "Weekly limit"), report.limits.secondary)));
+	}
+	if (!report.limits?.primary && !report.limits?.secondary) {
+		rows.push(line("Rate limits: unavailable"));
+	}
 	rows.push(line());
 	rows.push(line(`${report.view === "daily" ? "Daily" : "Weekly"} token activity:`));
 	if (report.view === "daily") {

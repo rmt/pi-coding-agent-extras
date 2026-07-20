@@ -297,8 +297,17 @@ function renderStatus(details: StatusDetails, width: number, theme: any): string
 	}
 	rows.push(line());
 	if (details.ok && details.limits) {
-		rows.push(line(progressLine(durationLabel(details.limits.primary, "5h limit"), details.limits.primary, theme, innerWidth)));
-		rows.push(line(progressLine(durationLabel(details.limits.secondary, "Weekly limit"), details.limits.secondary, theme, innerWidth)));
+		// ChatGPT may expose only a weekly primary window. Do not render a
+		// nonexistent secondary limit as an unavailable duplicate.
+		if (details.limits.primary) {
+			rows.push(line(progressLine(durationLabel(details.limits.primary, "5h limit"), details.limits.primary, theme, innerWidth)));
+		}
+		if (details.limits.secondary) {
+			rows.push(line(progressLine(durationLabel(details.limits.secondary, "Weekly limit"), details.limits.secondary, theme, innerWidth)));
+		}
+		if (!details.limits.primary && !details.limits.secondary) {
+			rows.push(line("Rate limits unavailable"));
+		}
 		if (details.limits.credits) {
 			const c = details.limits.credits;
 			const credits = c.unlimited ? "unlimited" : c.balance ? c.balance : c.hasCredits === false ? "none" : undefined;
